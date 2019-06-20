@@ -1,0 +1,393 @@
+---
+title: "Splice semi-supervised sample size determination"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+SHARELATEX_PROJ <- '/Users/aaron.richter/Dropbox/Apps/ShareLaTeX/splice_semi_ssd'
+BUCKET <- 'fau-bigdata'
+AWS_PROFILE <- 'faubigdata'
+
+source('setup.R')
+set_aws_profile(AWS_PROFILE)
+
+x_scale <- scale_x_continuous(name = 'Number of positive instances',
+                              limits = c(0, 6000), breaks = seq(0, 7000, 1000))
+```
+
+# Get data
+
+```{r, eval=F}
+# run once because there are a lot of small files to pull from S3
+get_bucket(BUCKET, 'semi_ssd/results/splice_actual') %>% 
+  map(get_object) %>% 
+  map(read_csv) %>% 
+  map(~mutate_at(., vars(rus), as.numeric)) %>% 
+  bind_rows() %>% 
+  write_csv('splice_actual.csv')
+
+get_bucket(BUCKET, 'semi_ssd/results/splice_pseudo') %>% 
+  map(get_object) %>% 
+  map(read_csv) %>% 
+  bind_rows() %>% 
+  write_csv('splice_pseudo.csv')
+```
+
+```{r}
+eval <- read_csv('splice_actual.csv') %>% 
+  filter(is.na(rus)) %>% 
+  filter(num_pos <= 6000)
+eval_mean <- eval %>% 
+  group_by(num_pos, num_neg, num_instances) %>% 
+  summarise(test_roc_auc = mean(test_roc_auc)) %>% 
+  ungroup() %>% 
+  mutate(#data = 'Actual',
+         prediction = test_roc_auc,
+         diff = prediction - lag(prediction, 2))
+
+pseudo <- read_csv('splice_pseudo.csv') %>% 
+  filter(is.na(rus)) %>% 
+  filter(num_pos <= 6000)
+```
+
+# Progress
+
+```{r}
+eval %>% count(num_pos) %>% datatable(filter = 'top')
+```
+
+```{r}
+pseudo %>% count(pseudo_size, num_pos) %>% datatable(filter = 'top')
+```
+
+# Pseudo 
+
+```{r}
+pseudo %>% 
+  group_by(pseudo_size) %>% 
+  summarise_at(vars(starts_with('lab')), mean) %>% 
+  kable()
+```
+
+<!-- #### Errors -->
+
+```{r, eval=F}
+errors <- pseudo %>% filter(!is.na(error))
+errors %>% 
+  group_by(pseudo_size, num_pos, num_neg, error = str_replace(error, ':.*', '')) %>% 
+  summarise(n = n(), mean(lab_num_neg), mean(lab_num_pos), mean(lab_threshold)) %>% 
+  datatable(filter = 'top')
+```
+
+# Sizes
+
+```{r}
+sizes <- eval_mean %>% 
+  select(num_instances, num_pos, num_neg) %>% 
+  distinct() %>% 
+  mutate(Positive = comma(num_pos),
+         Total = comma(num_instances),
+         Instances = glue('{Positive} ({Total})'))
+
+sizes %>% 
+  as.data.frame() %>% 
+  format(big.mark = ',') %>% 
+  datatable(filter = 'top')
+```
+
+```{r}
+actual_sizes <- sizes %>% 
+  filter(num_pos >= 100 & num_pos < 600) %>% 
+  select(Instances) %>% 
+  bind_rows(tibble(Instances = '...'),
+            sizes %>% filter(num_pos > 5600 & num_pos <= 6000) %>% select(Instances))
+fit_sizes <- sizes %>% 
+  filter(num_pos <= 100) %>% 
+  select(Instances)
+
+bind_cols(
+  actual_sizes %>% rename(Actual = Instances),
+  fit_sizes %>% rename(`Inverse power law` = Instances),
+  actual_sizes %>% rename(`Semi-supervised` = Instances)
+) %>% latex_table('sizes', 'Sampling schedules')
+```
+
+## Total models and time
+
+* Eval/power law - 69 sizes * 10 runs * 5 cv 
+* Pseudo - 10 models * 60 sizes * 10 runs * 5 cv)
+
+Number of models
+
+```{r}
+(69 * 10 * 5) + (10 * 60 * 10 * 5)
+```
+
+Time
+
+```{r}
+(eval %>% 
+  summarise(time = sum(score_time + fit_time)) %>% 
+  pull(time) + pseudo %>%
+  summarise(time = sum(score_time + fit_time, na.rm = T)) %>% 
+  pull(time)) / 60 / 60
+```
+
+# Baseline
+
+```{r}
+p <- ggplot(eval_mean %>% filter(num_pos == 10 | num_pos > 90), aes(x = num_pos, y = test_roc_auc)) + 
+  geom_line() +
+  x_scale + ylab('AUC')
+latex_figure(p, 'actual', 'Learning curve for Splice dataset.')
+```
+
+```{r}
+eval_mean %>% 
+  filter(num_pos <= 100) %>% 
+ggplot(aes(x = num_pos, y = test_roc_auc)) + 
+  geom_line() +
+  scale_x_continuous(breaks = seq(0, 110, 10))
+```
+
+# Predictions
+
+```{r}
+power_law_mean <- eval_mean %>% 
+  do(fit_curves(., 3:10)) %>% 
+  # filter(num_pos >= 100) %>%
+  mutate(predict_size = factor(predict_size, seq(10, 100, 10)),
+         data = 'Inverse power law') %>% 
+  select(-num_neg, -num_instances) %>% 
+  ungroup()
+
+pseudo_mean <- pseudo %>% 
+  filter(pseudo_size >= 30) %>% 
+  group_by(predict_size = factor(pseudo_size, levels = seq(10, 100, 10)), 
+           num_pos, 
+           data = 'Semi-supervised') %>% 
+  summarise(prediction = mean(test_roc_auc, na.rm = T)) %>% 
+  ungroup() %>% 
+  filter(!is.na(prediction)) %>% 
+  # filter(predict_size >= 30) %>%
+  inner_join(eval_mean %>% select(num_pos, actual = test_roc_auc), by = 'num_pos') %>% 
+  mutate(residual = prediction - actual) %>% 
+  group_by(predict_size) %>% 
+  mutate(mae = mean(abs(residual)),
+         rmse = sqrt(sum(residual^2) / length(residual))) %>% 
+  ungroup()
+
+compare_mean <- bind_rows(power_law_mean, pseudo_mean)
+```
+
+```{r, fig.width=10}
+p <- ggplot(compare_mean, aes(x = num_pos, y = prediction)) + 
+  geom_line(aes(group = predict_size, color = predict_size)) +
+  geom_line(aes(y = test_roc_auc), data = eval_mean, linetype = 'dotted') +
+  x_scale +
+  facet_wrap(~ data) + guides(color = guide_legend('Fit size')) +
+  xlab('Number of positive instances') + ylab('AUC')
+latex_figure(p, 'predictions', 'Approximated learning curves using the inverse power law and semi-supervised methods for various sizes used for curve fitting. Dotted line represents the actual learning curve.'
+             , twocolumn=T, latex_width='7in'
+             )
+```
+
+## Predict size = 50
+
+```{r}
+power_law_50 <- power_law_mean %>% filter(predict_size == 50)
+pseudo_50 <- pseudo_mean %>% filter(predict_size == 50)
+
+combined <- eval_mean %>% 
+  mutate(data = 'Actual',
+         prediction = test_roc_auc) %>% 
+  bind_rows(power_law_50, pseudo_50) %>% 
+  # filter(num_pos >= 100) %>%
+  mutate(Region = factor(case_when(num_pos <= 100 ~ 'Train',
+                                   # num_pos <= 1000 ~ 'Steep',
+                                   num_pos <= 2500 ~ 'Increase',
+                                   TRUE ~ 'Plateau'), 
+                                   levels = c('Train', 'Increase', 'Plateau')))
+
+p <- ggplot(combined, aes(x = num_pos, y = prediction)) + 
+  geom_line(aes(group = data, color = data)) +
+  # geom_vline(xintercept = 100, linetype = 'dashed', alpha = 0.5) + 
+  geom_vline(xintercept = 2500, linetype = 'dashed', alpha = 0.5) + 
+  x_scale
+latex_figure(p, 'predictions_50', 'Approximated learning curves using 50 positive instances for curve building.')
+```
+
+### Slope by section
+
+```{r}
+tidy_lm <- function(lm_model) {
+  o <- tidy(lm_model)
+  ci_df <- confint(lm_model, level=0.95) %>% data.frame() %>% rownames_to_column('term')
+  colnames(ci_df) <- c('term', 'ci_lower', 'ci_upper')
+  inner_join(o, ci_df, by = 'term')
+}
+
+slopes <- combined %>% 
+  group_by(data, Region) %>% 
+  do(tidy_lm(lm(prediction ~ num_pos, .))) 
+
+slopes %>% 
+  filter(term == 'num_pos') %>% 
+  mutate(val = glue('{round(estimate*1000, 3)} ({round(ci_lower*1000,3)}-{round(ci_upper*1000, 3)})')) %>%
+  select(data, Region, val) %>% 
+  spread(data, val) %>% 
+  latex_table('slopes', 'Curve slopes by Region')
+```
+
+```{r, fig.width=10}
+p <- ggplot(combined, aes(x = num_pos, y = prediction)) + 
+  stat_smooth(aes(color = data), method = 'lm') +
+  xlab('Number of positive instances') + ylab('AUC') +
+  facet_wrap(~ Region, scales = 'free') + 
+  theme(legend.position = 'bottom', legend.title = element_blank())
+latex_figure(p, 'slopes', 'Slopes for different regions of the learning curves.',
+             latex_width = '7in', twocolumn = T)
+```
+
+```{r, fig.width=8}
+p <- ggplot(slopes %>% filter(term == 'num_pos'), aes(x = data, y = estimate, color = Region)) +
+  geom_point() + 
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper)) +
+  facet_wrap(~ Region, scales = 'free_y') + 
+  theme(axis.text.x = element_text(vjust = 1, hjust = 0, angle = -45)) + 
+  guides(color = F)
+latex_figure(p, 'slopes_ci', 'Slopes for different Regions of the learning curves.',
+             twocolumn=T, latex_width='7in')
+```
+
+### MAE
+
+* Cumulative MAE as num pos increases (for predict_size = 50)
+
+```{r, fig.width=6, fig.height=8}
+cum_mae <- combined %>% 
+  filter(data != 'Actual') %>% 
+  filter(num_pos > 90) %>% 
+  group_by(data) %>% 
+  mutate(cum_mae = order_by(num_pos, cummean(abs(residual))))
+
+p <- ggplot(cum_mae, aes(x = num_pos, y = cum_mae, color = data)) +
+  geom_line() + 
+  x_scale +
+  ylab('MAE') + 
+  facet_wrap(~ data, scales = 'free_y', ncol = 1) + guides(color = F)
+latex_figure(p, 'mae', 'MAE as prediction size increases (using fit size of 50).')
+```
+
+* MAE / RMSE for full curves
+
+```{r}
+mae_compare <- compare_mean %>% 
+  select(Method = data, Size = predict_size, MAE = mae, RMSE = rmse) %>% 
+  distinct()
+kable(mae_compare %>% select(-RMSE) %>% spread(Method, MAE))
+```
+
+```{r}
+mae_compare %>% 
+  gather(measure, value, -Method, -Size) %>% 
+ggplot(aes(x = Size, y = value, fill = Method)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  facet_wrap(~ measure, ncol = 1) + xlab('Predict Size')
+```
+
+# Convergence detection
+
+## Linear regression with local sampling (LRLS)
+
+* n neighbors = 4
+
+```{r}
+lrls <- function(df, predict_point, i=200) {
+  lm_data <- df %>% 
+    filter(num_pos >= predict_point - i) %>% 
+    filter(num_pos <= predict_point + i)
+
+  m <- lm(prediction ~ num_pos, data = lm_data)
+  ci <- confint(m, 'num_pos', level=0.95)
+
+  df %>% 
+    filter(num_pos == predict_point) %>% 
+    mutate(slope = m$coefficients['num_pos'][[1]],
+           slope_ci_lwr = ci[[1]],
+           slope_ci_upr = ci[[2]])
+}
+
+eval_slope <- eval_mean %>% 
+  filter(num_pos > 200) %>% 
+  filter(num_pos < 6800) %>% 
+  rowwise() %>%
+  do(lrls(eval_mean, .$num_pos)) %>% 
+  mutate(data = 'Actual')
+
+power_law_slope <- power_law_50 %>% 
+  filter(num_pos > 200) %>% 
+  filter(num_pos < 6800) %>% 
+  rowwise() %>%
+  do(lrls(power_law_50, .$num_pos))
+
+pseudo_slope <- pseudo_50 %>% 
+  filter(num_pos > 200) %>% 
+  filter(num_pos < 6800) %>% 
+  rowwise() %>%
+  do(lrls(pseudo_50, .$num_pos))
+
+slope_compare <- bind_rows(eval_slope, power_law_slope, pseudo_slope) %>% 
+  mutate(Region = factor(case_when(num_pos <= 100 ~ 'Train',
+                                   # num_pos <= 1000 ~ 'Steep',
+                                   num_pos <= 2500 ~ 'Increase',
+                                   TRUE ~ 'Plateau'), 
+                                   levels = c('Train', 'Increase', 'Plateau')))
+```
+
+```{r}
+ggplot(slope_compare, aes(x = num_pos, group = data)) +
+  geom_line(aes(y = slope, color = data)) +
+  geom_ribbon(aes(ymin = slope_ci_lwr, ymax = slope_ci_upr, fill = data), alpha = 0.3)
+```
+
+```{r}
+options(scipen=10000)
+p <- ggplot(slope_compare %>% filter(num_pos < 2000), aes(x = num_pos, group = data)) +
+  geom_line(aes(y = slope, color = data)) +
+  geom_ribbon(aes(ymin = slope_ci_lwr, ymax = slope_ci_upr, fill = data), alpha = 0.3) +
+  geom_hline(yintercept = 0.0001, linetype = 'dashed', alpha = 0.5) + 
+  scale_x_continuous(name = 'Number of positive instances', breaks = seq(0, 2000, 200)) +
+  scale_y_continuous(name = 'Slope (LRLS)', breaks = seq(0, 0.0007, 0.0001)) +
+  theme(legend.position = 'bottom', legend.title = element_blank())
+latex_figure(p, 'convergence', 'Point-wise slopes determined by LRLS. The dotted line represents a point of convergence.')
+```
+
+# But wait, why not just use small data or semi-supervised for actual model?
+
+```{r}
+semi_compare <- get_object('s3://fau-bigdata/semi_ssd/results/splice_semi_compare.csv') %>% 
+  read_csv %>% 
+  mutate(which = case_when(!is.na(pseudo_pos_size) ~ 'Pseudo 50',
+                           train_pos_size == 50 ~ 'Train 50',
+                           train_pos_size == 2500 ~ 'Train 2500'))
+```
+
+```{r}
+semi_compare %>% 
+  group_by(which) %>% 
+  summarise(auc = mean(auc)) %>% kable()
+```
+
+```{r}
+base <- semi_compare %>% filter(which == 'Train 2500') %>% pull(auc)
+small <- semi_compare %>% filter(which == 'Train 50') %>% pull(auc)
+pseudo <- semi_compare %>% filter(which == 'Pseudo 50') %>% pull(auc)
+
+t.test(base, small)
+t.test(base, pseudo)
+t.test(small, pseudo)
+```
+
